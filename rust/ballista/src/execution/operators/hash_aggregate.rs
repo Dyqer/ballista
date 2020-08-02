@@ -18,6 +18,8 @@
 //! Ballista Hash Aggregate operator. This is based on the implementation from DataFusion in the
 //! Apache Arrow project.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -162,6 +164,7 @@ macro_rules! extract_aggr_value {
     ($BUILDER:ident, $TY:ident, $TY2:ty, $MAP:expr, $COL_INDEX:expr) => {{
         let mut builder = array::$BUILDER::new($MAP.len());
         for v in $MAP.values() {
+            let v = v.borrow();
             match v[$COL_INDEX].as_ref().get_value()? {
                 None => builder.append_null()?,
                 Some(ScalarValue::$TY(n)) => builder.append_value(n as $TY2)?,
@@ -253,7 +256,7 @@ fn run(
         let mut row_count = 0;
 
         // hash map of grouping values to accumulators
-        let mut map: HashMap<Vec<GroupByScalar>, AccumulatorSet> = HashMap::new();
+        let mut map: HashMap<Vec<GroupByScalar>, Rc<RefCell<AccumulatorSet>>> = HashMap::new();
 
         // create vector large enough to hold the grouping key that can be re-used per row to
         // avoid the cost of creating a new vector each time
@@ -261,6 +264,11 @@ fn run(
         for _ in 0..group_expr.len() {
             key.push(GroupByScalar::UInt32(0));
         }
+
+        // it is faster to process data in mini batches, first looking up accumulators in the
+        // map, and then doing the accumulation for that batch
+        let batch_size = 512;
+        let mut accumulator_batch = Vec::with_capacity(batch_size);
 
         // iterate over all the input batches .. note that in partial mode it would be valid
         // to emit batches periodically and reset the accumulator map to reduce memory pressure
@@ -271,8 +279,9 @@ fn run(
 
             match maybe_batch {
                 Some(batch) => {
+                    let total_rows = batch.num_rows();
                     batch_count += 1;
-                    row_count += batch.num_rows();
+                    row_count += total_rows;
 
                     let accum_start = Instant::now();
 
@@ -288,31 +297,47 @@ fn run(
                         .map(|e| e.evaluate_input(&batch))
                         .collect::<Result<Vec<_>>>()?;
 
-                    // we now need to switch to row-based processing :-(
-                    for row in 0..batch.num_rows() {
-                        // create grouping key for this row
-                        create_key(&group_values, row, &mut key)?;
+                    let mut row = 0;
+                    while row < total_rows {
+                        // build batch of accumulators
+                        accumulator_batch.clear();
+                        let mut i = 0;
+                        while i < batch_size && row + i < total_rows {
+                            let row_index = row + i;
 
-                        // lookup the accumulators for this grouping key
-                        let updated = match map.get_mut(&key) {
-                            Some(mut accumulators) => {
-                                accumulate(&aggr_input_values, &mut accumulators, row)?;
-                                true
-                            }
-                            None => false,
-                        };
+                            // create grouping key for this row
+                            create_key(&group_values, row_index, &mut key)?;
 
-                        // create the accumulators for this grouping key if they weren't found
-                        if !updated {
-                            let mut accumulators: AccumulatorSet = aggr_expr
-                                .iter()
-                                .map(|expr| expr.create_accumulator(&mode))
-                                .collect();
+                            // lookup the accumulators for this grouping key
+                            let accumulators = match map.get_mut(&key) {
+                                Some(accumulators) => accumulators.clone(),
+                                None => {
+                                    let accumulators: AccumulatorSet = aggr_expr
+                                        .iter()
+                                        .map(|expr| expr.create_accumulator(&mode))
+                                        .collect();
+                                    let accumulators = Rc::new(RefCell::new(accumulators));
+                                    map.insert(key.clone(), accumulators.clone());
+                                    accumulators
+                                }
+                            };
 
-                            accumulate(&aggr_input_values, &mut accumulators, row)?;
-
-                            map.insert(key.clone(), accumulators);
+                            accumulator_batch.push(accumulators);
+                            i += 1;
                         }
+
+                        // accumulate the mini batch
+                        i = 0;
+                        while i < batch_size && row + i < total_rows {
+                            let row_index = row + i;
+                            let mut accumulator_set = accumulator_batch[i].borrow_mut();
+                            accumulate(&aggr_input_values, &mut accumulator_set, row_index)?;
+                            i += 1;
+                        }
+
+                        // note that final value here can exceed batch.num_rows so should
+                        // not be used after this loop
+                        row += batch_size;
                     }
                     accum_batch_time += accum_start.elapsed().as_millis();
                 }
@@ -363,7 +388,6 @@ fn run(
     })
 }
 
-#[inline]
 fn accumulate(
     aggr_input_values: &[ColumnarValue],
     accumulators: &mut AccumulatorSet,
@@ -551,7 +575,7 @@ fn create_key(
 
 /// Create a columnar batch from the hash map
 fn create_batch_from_accum_map(
-    map: &HashMap<Vec<GroupByScalar>, AccumulatorSet>,
+    map: &HashMap<Vec<GroupByScalar>, Rc<RefCell<AccumulatorSet>>>,
     input_schema: &Schema,
     group_expr: &[Arc<dyn Expression>],
     aggr_expr: &[Arc<dyn AggregateExpr>],
